@@ -131,8 +131,9 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("Predict API error:", error);
+    const msg = error instanceof Error ? error.message : String(error);
     return NextResponse.json(
-      { error: "Terjadi kesalahan pada server" },
+      { error: "Terjadi kesalahan pada server", detail: msg },
       { status: 500 }
     );
   }
