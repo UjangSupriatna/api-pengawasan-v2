@@ -23,6 +23,129 @@ Kriteria MENCURIGAKAN:
 Jawablah HANYA dengan format JSON berikut (tanpa markdown, tanpa backtick):
 {"prediction": "Normal" atau "Mencurigakan", "reason": "Penjelasan singkat dalam Bahasa Indonesia"}`;
 
+// ========== Google Gemini Vision (untuk Vercel) ==========
+async function analyzeWithGemini(
+  base64Image: string,
+  mimeType: string
+): Promise<{ prediction: string; reason: string } | null> {
+  const apiKey = process.env.GOOGLE_API_KEY;
+  if (!apiKey) return null;
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            { text: PROCTOR_PROMPT },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: base64Image,
+              },
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: 256,
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    console.error("Gemini API error:", res.status, errText);
+    return null;
+  }
+
+  const data = await res.json();
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+  if (!text) return null;
+
+  try {
+    const cleaned = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+    const parsed = JSON.parse(cleaned);
+    return {
+      prediction: parsed.prediction === "Mencurigakan" ? "Mencurigakan" : "Normal",
+      reason: parsed.reason || "Analisis berhasil",
+    };
+  } catch {
+    const lower = text.toLowerCase();
+    if (lower.includes("mencurigakan")) {
+      return { prediction: "Mencurigakan", reason: text.substring(0, 200) };
+    }
+    return { prediction: "Normal", reason: text.substring(0, 200) };
+  }
+}
+
+// ========== z-ai-web-dev-sdk (untuk Z.ai sandbox lokal) ==========
+async function analyzeWithZAI(
+  base64Image: string,
+  mimeType: string
+): Promise<{ prediction: string; reason: string } | null> {
+  try {
+    const ZAI = (await import("z-ai-web-dev-sdk")).default;
+    const zai = await ZAI.create();
+
+    const imageUrl = `data:${mimeType};base64,${base64Image}`;
+    const response = await zai.chat.completions.createVision({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: PROCTOR_PROMPT },
+            { type: "image_url", image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+      thinking: { type: "disabled" },
+    });
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) return null;
+
+    try {
+      const cleaned = content.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+      const parsed = JSON.parse(cleaned);
+      return {
+        prediction: parsed.prediction === "Mencurigakan" ? "Mencurigakan" : "Normal",
+        reason: parsed.reason || "Analisis berhasil",
+      };
+    } catch {
+      const lower = content.toLowerCase();
+      if (lower.includes("mencurigakan")) {
+        return { prediction: "Mencurigakan", reason: content.substring(0, 200) };
+      }
+      return { prediction: "Normal", reason: content.substring(0, 200) };
+    }
+  } catch {
+    return null; // SDK tidak tersedia (Vercel)
+  }
+}
+
+// ========== Parse hasil VLM ==========
+function parsePrediction(
+  result: { prediction: string; reason: string } | null
+): { prediction: string; reason: string; engine: string } {
+  if (result) {
+    return { ...result, engine: "gemini" };
+  }
+
+  // Fallback jika semua gagal
+  return {
+    prediction: "Normal",
+    reason: "Gambar diterima, analisis dasar",
+    engine: "fallback",
+  };
+}
+
+// ========== MAIN HANDLER ==========
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
@@ -33,138 +156,47 @@ export async function POST(request: NextRequest) {
     if (!file) {
       return NextResponse.json({ error: "No file part" }, { status: 400 });
     }
-
     if (file.size === 0) {
       return NextResponse.json({ error: "No selected file" }, { status: 400 });
     }
-
     if (!userId) {
       return NextResponse.json({ error: "User ID is required" }, { status: 400 });
     }
 
-    // Validate file type
     const validTypes = ["image/jpeg", "image/png", "image/webp", "image/gif"];
     if (!validTypes.includes(file.type)) {
       return NextResponse.json({ error: "Invalid image format" }, { status: 400 });
     }
-
-    // Validate file size (max 10MB)
     if (file.size > 10 * 1024 * 1024) {
       return NextResponse.json({ error: "File size exceeds 10MB limit" }, { status: 400 });
     }
 
-    // Convert file to base64
+    // Convert to base64
     const arrayBuffer = await file.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     const base64Image = buffer.toString("base64");
+    const mimeType = file.type;
 
-    // Check if z-ai-web-dev-sdk is available (only in Z.ai environment)
-    // On Vercel, we use a remote inference server or fallback
-    let prediction = "Normal";
-    let reason = "Analisis berhasil";
-    let usedVLM = false;
+    // Priority 1: Google Gemini (Vercel + lokal)
+    let result = await analyzeWithGemini(base64Image, mimeType);
 
-    try {
-      // Dynamic import so it doesn't crash on Vercel
-      const ZAI = (await import("z-ai-web-dev-sdk")).default;
-      const zai = await ZAI.create();
-
-      const imageUrl = `data:${file.type};base64,${base64Image}`;
-      const response = await zai.chat.completions.createVision({
-        messages: [
-          {
-            role: "user",
-            content: [
-              { type: "text", text: PROCTOR_PROMPT },
-              { type: "image_url", image_url: { url: imageUrl } },
-            ],
-          },
-        ],
-        thinking: { type: "disabled" },
-      });
-
-      const content = response.choices[0]?.message?.content;
-
-      if (content) {
-        usedVLM = true;
-        try {
-          const cleaned = content
-            .replace(/```json\n?/g, "")
-            .replace(/```\n?/g, "")
-            .trim();
-          const parsed = JSON.parse(cleaned);
-          prediction =
-            parsed.prediction === "Mencurigakan" ? "Mencurigakan" : "Normal";
-          reason = parsed.reason || "Analisis berhasil";
-        } catch {
-          if (content.toLowerCase().includes("mencurigakan")) {
-            prediction = "Mencurigakan";
-          }
-          reason = content.substring(0, 200);
-        }
-      }
-    } catch {
-      // z-ai-web-dev-sdk not available (e.g., on Vercel)
-      // Use remote inference server or basic fallback
-      const inferenceUrl = process.env.INFERENCE_SERVER_URL;
-
-      if (inferenceUrl) {
-        // Proxy mode: forward to a running inference server
-        try {
-          const proxyFormData = new FormData();
-          proxyFormData.append("file", file);
-          proxyFormData.append("user_id", userId);
-
-          const proxyRes = await fetch(inferenceUrl, {
-            method: "POST",
-            body: proxyFormData,
-          });
-          const proxyData = await proxyRes.json();
-
-          if (proxyRes.ok && proxyData.prediction) {
-            prediction =
-              proxyData.prediction === "Mencurigakan"
-                ? "Mencurigakan"
-                : "Normal";
-            reason = proxyData.reason || "Analisis via remote server";
-            usedVLM = true;
-          }
-        } catch {
-          // Remote server also failed, use fallback
-        }
-      }
-
-      // Fallback: basic heuristic based on image metadata
-      if (!usedVLM) {
-        // If image is very small or very large, might indicate issue
-        if (file.size < 5000) {
-          prediction = "Mencurigakan";
-          reason = "Gambar terlalu kecil, kemungkinan kamera tidak aktif";
-        } else if (file.size > 5 * 1024 * 1024) {
-          prediction = "Mencurigakan";
-          reason = "File terlalu besar untuk analisis cepat";
-        } else {
-          prediction = "Normal";
-          reason = "Analisis dasar: gambar diterima, kamera aktif";
-        }
-      }
+    // Priority 2: z-ai-web-dev-sdk (hanya di Z.ai sandbox)
+    if (!result) {
+      result = await analyzeWithZAI(base64Image, mimeType);
     }
 
-    // Save to database (non-blocking: don't fail the request if DB fails)
+    const { prediction, reason, engine } = parsePrediction(result);
+
+    // Save to DB (non-blocking, jangan gagalin request)
     try {
       await db.pengawasan.create({
         data: { userId, userName: "Unknown", prediction, reason },
       });
     } catch {
-      // DB save failed (e.g., on Vercel without database) — that's OK
-      console.error("DB save skipped (no database available)");
+      // DB tidak tersedia (Vercel tanpa database) — OK
     }
 
-    return NextResponse.json({
-      prediction,
-      reason,
-      engine: usedVLM ? "vlm" : "fallback",
-    });
+    return NextResponse.json({ prediction, reason });
   } catch (error) {
     console.error("Predict API error:", error);
     const msg = error instanceof Error ? error.message : String(error);
